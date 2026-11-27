@@ -1,0 +1,30 @@
+[package]
+name = "app-switch-claude"
+version = "0.1.0"
+edition = "2024"
+description = "Chuyển nhanh giữa các tài khoản Claude trên ứng dụng Claude Desktop (macOS và Windows)"
+
+[lib]
+name = "app_switch_claude"
+path = "src/lib.rs"
+
+[[bin]]
+name = "app-switch-claude"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "7"
+eframe = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+tempfile = "3"
+
+[profile.release]
+strip = true
