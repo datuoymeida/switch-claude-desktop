@@ -14,21 +14,38 @@ Claude không lưu e-mail ở dạng đọc được trên máy, nên tên tài 
 
 ## Build và chạy
 
-Cần [Rust](https://rustup.rs) (bản stable mới).
+Cần [Rust](https://rustup.rs) (bản stable mới, cài qua rustup).
 
 **macOS**
 
 ```sh
 cargo run --release              # chạy thử
-./scripts/bundle-macos.sh        # tạo target/release/bundle/AppSwitchClaude.app
+./scripts/bundle-macos.sh        # tạo AppSwitchClaude.app (chip Apple và Intel) và file .dmg
 ```
 
-**Windows** (cần thêm "Build Tools for Visual Studio" với C++ build tools)
+Kết quả: `target/release/bundle/AppSwitchClaude.app` để chạy ngay trên máy này, và `dist/macos/AppSwitchClaude.dmg` để đưa sang máy Mac khác.
+
+**Windows**, build ngay trên Windows (cần thêm "Build Tools for Visual Studio" với C++ build tools):
 
 ```powershell
 cargo build --release
 .\target\release\app-switch-claude.exe
 ```
+
+**Windows**, build chéo từ macOS hoặc Linux (cần Docker đang chạy; không cài thêm gì lên máy):
+
+```sh
+./scripts/build-windows.sh       # tạo dist/windows/AppSwitchClaude.exe và AppSwitchClaude-probe.exe
+```
+
+`AppSwitchClaude-probe.exe` là bản chẩn đoán chỉ đọc (giống `cargo run --example probe`). Trên một máy Windows mới, nên chạy nó trước trong PowerShell để xem ứng dụng nhận ra những gì.
+
+### Mở trên máy khác
+
+Các file trong `dist/` không được ký bằng chứng chỉ nhà phát triển, nên máy khác sẽ hỏi lại ở lần mở đầu tiên:
+
+- **macOS:** mở file `.dmg`, kéo ứng dụng vào Applications rồi mở. Nếu bị chặn, vào System Settings → Privacy & Security → **Open Anyway**.
+- **Windows:** nếu hiện "Windows protected your PC", bấm **More info** → **Run anyway**.
 
 ## Cách hoạt động
 
@@ -64,6 +81,8 @@ cargo test --test real_data -- --ignored --nocapture     # diễn tập trên B�
 `probe` và `real_data` chỉ đọc dữ liệu của Claude và không in giá trị bí mật nào. Nên chạy cả hai trên một máy hoặc kiểu cài đặt mới (nhất là Windows) trước khi dùng thật.
 
 Hai biến môi trường để thử nghiệm: `APP_SWITCH_CLAUDE_DATA_DIR` (thư mục dữ liệu Claude) và `APP_SWITCH_CLAUDE_STORE_DIR` (kho lưu tài khoản).
+
+Trên Windows, nếu ứng dụng báo "Không mở được cửa sổ ứng dụng" kèm một lỗi WGPU thì nguyên nhân nằm ở trình điều khiển đồ hoạ. Thử đặt biến môi trường `WGPU_BACKEND=vulkan` (hoặc `gl`) rồi mở lại.
 
 ## Cấu trúc mã
 
