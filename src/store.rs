@@ -41,6 +41,10 @@ pub struct Account {
     pub saved_at: i64,
     #[serde(default)]
     pub last_used_at: Option<i64>,
+    /// Claude signed this account out (in the app, or because the server refused the
+    /// session), so the saved session no longer works and the account must log in again.
+    #[serde(default)]
+    pub signed_out: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +229,7 @@ mod tests {
             created_at: 1,
             saved_at: 2,
             last_used_at: None,
+            signed_out: false,
         }
     }
 

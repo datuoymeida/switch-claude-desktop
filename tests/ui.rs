@@ -31,6 +31,7 @@ fn account(id: &str, label: &str, is_live: bool, session: SessionProbe) -> Accou
             created_at: now_unix() - 40 * DAY,
             saved_at: now_unix() - DAY,
             last_used_at: None,
+            signed_out: false,
         },
         is_live,
         has_snapshot: true,
@@ -351,6 +352,69 @@ fn a_startup_failure_is_shown_instead_of_an_empty_window() {
     assert!(harness.query_by_label("+  Thêm tài khoản").is_none());
 }
 
+/// What the user's own first test ran into: "dev" was logged out inside Claude, "cty" is in
+/// use, and Claude is at its login screen after refusing the old session of "dev".
+fn after_a_log_out_inside_claude() -> Overview {
+    let mut dev = account("dev", "dev", false, logged_in(26));
+    dev.account.signed_out = true;
+    overview(
+        LiveSession::LoggedOut,
+        true,
+        vec![dev, account("cty", "cty", false, logged_in(28))],
+    )
+}
+
+#[test]
+fn a_signed_out_account_offers_to_log_in_again() {
+    let mut harness = open(after_a_log_out_inside_claude());
+    harness.get_by_label("CLAUDE CHƯA ĐĂNG NHẬP");
+    harness.get_by_label("Đã bị đăng xuất khỏi Claude");
+    // The other account still switches as usual; exactly one of each button exists.
+    harness.get_by_label("Chuyển");
+    // Claude is already running, so there is nothing to open.
+    assert!(harness.query_by_label("Mở Claude").is_none());
+
+    harness.get_by_label("Đăng nhập lại").click();
+    settle(&mut harness);
+    assert_eq!(
+        harness.state().jobs,
+        [Job::Switch {
+            id: "dev".into(),
+            force_quit: false
+        }]
+    );
+}
+
+#[test]
+fn says_so_the_moment_claude_signs_a_saved_account_out() {
+    let mut harness = open(two_accounts());
+    let mut signed_out = two_accounts();
+    signed_out.live = LiveSession::LoggedOut;
+    signed_out.accounts[0].is_live = false;
+    signed_out.accounts[0].account.signed_out = true;
+
+    harness
+        .state_mut()
+        .view
+        .set_overview(Ok(signed_out.clone()));
+    settle(&mut harness);
+    let notice = "Claude đã đăng xuất “Công việc” nên phiên đã lưu của tài khoản này không còn \
+                  dùng được. Hãy đăng nhập lại “Công việc” trong Claude.";
+    harness.get_by_label(notice);
+
+    // Said once: dismissing it is final while nothing new happens.
+    harness.get_by_label("Đóng").click();
+    harness.state_mut().view.set_overview(Ok(signed_out));
+    settle(&mut harness);
+    assert!(harness.query_by_label(notice).is_none());
+}
+
+#[test]
+fn an_account_already_signed_out_at_startup_raises_no_alarm() {
+    let harness = open(after_a_log_out_inside_claude());
+    assert!(harness.query_by_label("Đóng").is_none());
+}
+
 /// Paint the main screens to PNG files for visual review.
 #[test]
 fn renders_previews() {
@@ -414,6 +478,18 @@ fn renders_previews() {
         "Claude đã được mở lại trong lúc đang đổi tài khoản. Hãy bấm Chuyển lần nữa.".into(),
     ));
     screens.push(("error-light", Theme::Light, failed));
+
+    let mut lost = screen(two_accounts());
+    let mut signed_out = after_a_log_out_inside_claude();
+    signed_out.accounts[0].account.id = "work".into();
+    signed_out.accounts[0].account.label = "Công việc".into();
+    lost.view.set_overview(Ok(signed_out));
+    screens.push(("signed-out-light", Theme::Light, lost));
+    screens.push((
+        "signed-out-dark",
+        Theme::Dark,
+        screen(after_a_log_out_inside_claude()),
+    ));
 
     let mut stuck = screen(many());
     stuck

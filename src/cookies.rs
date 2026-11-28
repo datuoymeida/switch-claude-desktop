@@ -65,7 +65,22 @@ pub fn probe_session(dir: &Path) -> SessionProbe {
     let Some(db) = cookie_db_path(dir) else {
         return SessionProbe::LoggedOut;
     };
-    match read_cookie_meta(&db) {
+    // Chromium empties the rollback journal when a write is complete. While the journal
+    // has content the database is being rewritten, and what it holds at this instant may
+    // be neither the old state nor the new one. Checked before and after reading it.
+    let mid_write = || {
+        let mut journal = db.clone().into_os_string();
+        journal.push("-journal");
+        std::fs::metadata(journal).is_ok_and(|journal| journal.len() > 0)
+    };
+    if mid_write() {
+        return SessionProbe::Unknown;
+    }
+    let cookies = read_cookie_meta(&db);
+    if mid_write() {
+        return SessionProbe::Unknown;
+    }
+    match cookies {
         Ok(cookies) => find_session(&cookies),
         Err(_) => SessionProbe::Unknown,
     }

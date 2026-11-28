@@ -16,7 +16,10 @@ use crate::store::MAX_LABEL_CHARS;
 use crate::switcher::{AccountView, LiveSession, Overview};
 use style::{Palette, bold};
 
-pub const WINDOW_TITLE: &str = "Chuyển tài khoản Claude";
+/// The title of the window: the app's name, in English at the user's request.
+pub const WINDOW_TITLE: &str = "Claude Account Switcher";
+/// The heading inside the window, in the language of the rest of the interface.
+const HEADING: &str = "Chuyển tài khoản Claude";
 
 /// Something the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +142,17 @@ impl View {
     pub fn set_overview(&mut self, overview: Result<Overview, String>) {
         match overview {
             Ok(overview) => {
+                // Say so the moment Claude signs a saved account out: it is the one event
+                // that costs the user a saved session, and it happens outside this window.
+                if let Some(label) = newly_signed_out(self.overview.as_ref(), &overview) {
+                    self.notice = Some(Notice {
+                        text: format!(
+                            "Claude đã đăng xuất “{label}” nên phiên đã lưu của tài khoản này \
+                             không còn dùng được. Hãy đăng nhập lại “{label}” trong Claude."
+                        ),
+                        is_error: true,
+                    });
+                }
                 self.overview = Some(overview);
                 self.load_error = None;
             }
@@ -230,11 +244,28 @@ impl View {
     }
 }
 
+/// The saved account that Claude signed out between two looks at it, if any.
+fn newly_signed_out<'a>(previous: Option<&Overview>, current: &'a Overview) -> Option<&'a str> {
+    let previous = previous?;
+    current
+        .accounts
+        .iter()
+        .map(|view| &view.account)
+        .filter(|account| account.signed_out)
+        .find(|account| {
+            previous
+                .accounts
+                .iter()
+                .any(|was| was.account.id == account.id && !was.account.signed_out)
+        })
+        .map(|account| account.label.as_str())
+}
+
 fn header(ui: &mut Ui, palette: &Palette, overview: Option<&Overview>) {
     Sides::new().show(
         ui,
         |ui| {
-            ui.label(RichText::new(WINDOW_TITLE).heading());
+            ui.label(RichText::new(HEADING).heading());
         },
         |ui| {
             if let Some(overview) = overview {
@@ -304,7 +335,10 @@ fn live_card(
         }
         LiveSession::LoggedOut => {
             caption(ui, palette.muted, "CLAUDE CHƯA ĐĂNG NHẬP");
-            ui.label("Đăng nhập trong Claude Desktop, tài khoản sẽ hiện ở đây để bạn lưu.");
+            ui.label(
+                "Đăng nhập trong Claude Desktop. Tài khoản mới sẽ hiện ở đây để bạn lưu; tài \
+                 khoản đã có trong danh sách sẽ được nhận ra.",
+            );
             if !overview.claude_running && ui.button("Mở Claude").clicked() {
                 *job = Some(Job::OpenClaude);
             }
@@ -409,8 +443,14 @@ fn account_row(
                     });
                 }
                 if !view.is_live {
-                    let switch =
-                        ui.add_enabled(view.has_snapshot, primary_button(palette, "Chuyển"));
+                    // A session Claude signed out is restored all the same: Claude then
+                    // asks for the login of exactly this account.
+                    let text = if account.signed_out {
+                        "Đăng nhập lại"
+                    } else {
+                        "Chuyển"
+                    };
+                    let switch = ui.add_enabled(view.has_snapshot, primary_button(palette, text));
                     if switch.clicked() {
                         *job = Some(Job::Switch {
                             id: account.id.clone(),
@@ -438,6 +478,9 @@ fn session_text(view: &AccountView, now: i64) -> (String, bool) {
     const DAY: i64 = 86_400;
     if !view.has_snapshot && !view.is_live {
         return (String::from("Chưa có phiên đăng nhập được lưu"), true);
+    }
+    if view.account.signed_out && !view.is_live {
+        return (String::from("Đã bị đăng xuất khỏi Claude"), true);
     }
     match view.session {
         SessionProbe::LoggedIn {
@@ -674,6 +717,7 @@ mod tests {
                 created_at: 0,
                 saved_at: 0,
                 last_used_at: None,
+                signed_out: false,
             },
             is_live,
             has_snapshot,
@@ -709,6 +753,23 @@ mod tests {
         );
         assert!(session_text(&view(SessionProbe::LoggedOut, true, false), NOW).1);
         assert!(session_text(&view(SessionProbe::LoggedOut, false, false), NOW).1);
+    }
+
+    #[test]
+    fn a_signed_out_account_says_so_whatever_its_cookie_claims() {
+        let cookie = SessionProbe::LoggedIn {
+            expires_unix: Some(NOW + 30 * DAY),
+        };
+        let mut lost = view(cookie, true, false);
+        lost.account.signed_out = true;
+        let (text, attention) = session_text(&lost, NOW);
+        assert!(text.starts_with("Đã bị đăng xuất"), "{text}");
+        assert!(attention);
+
+        // Live again (the user logged back in): the live session is what counts.
+        lost.is_live = true;
+        let (text, _) = session_text(&lost, NOW);
+        assert!(text.starts_with("Phiên còn hạn đến "), "{text}");
     }
 
     #[test]

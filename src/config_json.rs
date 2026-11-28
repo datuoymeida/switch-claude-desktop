@@ -27,6 +27,9 @@ pub const CONFIG_FILE: &str = "config.json";
 pub const JOURNAL_FILE: &str = "config.json.journal";
 pub const ACCOUNT_UUID_KEY: &str = "lastKnownAccountUuid";
 const OAUTH_PREFIX: &str = "oauth:";
+/// An emptied token cache is still one encrypted block (28 characters as stored); a cache
+/// that holds tokens runs to hundreds of characters.
+const EMPTY_TOKEN_CACHE_MAX_LEN: usize = 64;
 
 pub type ConfigMap = Map<String, Value>;
 
@@ -51,6 +54,17 @@ pub fn account_uuid(config: &ConfigMap) -> Option<String> {
         .as_str()
         .filter(|uuid| !uuid.is_empty())
         .map(str::to_owned)
+}
+
+/// Whether Claude holds OAuth tokens for the signed-in account. It empties its token caches
+/// the moment it finds itself signed out, well before the login cookie leaves the disk.
+pub fn has_tokens(config: &ConfigMap) -> bool {
+    config.iter().any(|(key, value)| {
+        key.starts_with(OAUTH_PREFIX)
+            && value
+                .as_str()
+                .is_some_and(|cache| cache.len() > EMPTY_TOKEN_CACHE_MAX_LEN)
+    })
 }
 
 /// The configuration Claude would load on its next start: the pending journal when one

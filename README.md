@@ -10,6 +10,8 @@ Chuyển nhanh giữa nhiều tài khoản Claude trong ứng dụng **Claude De
 
 > **Đừng bấm "Log out" trong Claude** với tài khoản muốn giữ: thao tác đó huỷ phiên trên máy chủ nên bản đã lưu cũng mất hiệu lực. Muốn đăng nhập tài khoản khác, hãy dùng **+ Thêm tài khoản**.
 
+Nếu lỡ Log out (hoặc phiên bị máy chủ huỷ vì lý do khác), ứng dụng nhận ra và ghi **"Đã bị đăng xuất khỏi Claude"** ở tài khoản đó. Bấm **Đăng nhập lại** ở tài khoản ấy rồi đăng nhập đúng nó trong Claude: ứng dụng nhận ra tài khoản qua mã của Claude, không cần lưu lại, và phiên mới được chụp khi bạn chuyển sang tài khoản khác.
+
 Claude không lưu e-mail ở dạng đọc được trên máy, nên tên tài khoản do bạn tự đặt (đổi được bằng **Đổi tên**). **Xoá** chỉ bỏ bản lưu trên máy, không đụng tới tài khoản Claude.
 
 ## Build và chạy
@@ -67,6 +69,7 @@ Cookie và token **không bao giờ được giải mã**. Chúng vẫn được
 
 - Phiên đăng nhập của Claude có hạn (khoảng 4 tuần). Ứng dụng hiện ngày hết hạn; khi hết, bấm **Chuyển** sang tài khoản đó rồi đăng nhập lại trong Claude là bản lưu được làm mới.
 - Mỗi lúc Claude Desktop chỉ dùng một tài khoản; chuyển tài khoản là khởi động lại Claude (vài giây).
+- Ứng dụng không hỏi được máy chủ xem một phiên đã lưu còn sống không (nó không kết nối mạng và không giải mã cookie). Nó chỉ biết phiên đã chết khi thấy Claude tự đăng xuất tài khoản đó, hoặc thấy Claude đang đăng nhập một tài khoản khác mà không qua ứng dụng. Một phiên bị huỷ từ nơi khác (ví dụ "đăng xuất mọi thiết bị" trên web) chỉ lộ ra khi chuyển sang: Claude hiện màn hình đăng nhập và ứng dụng báo lại sau vài giây.
 - Trên Windows không có cách yêu cầu Claude tự thoát khi nó thu về khay hệ thống, nên ứng dụng phải kết thúc tiến trình Claude. Việc đang làm dở trong Claude lúc bấm chuyển có thể mất.
 - Nếu Claude Desktop đổi cách lưu phiên ở một bản cập nhật sau này, ứng dụng cần được cập nhật theo.
 
@@ -79,6 +82,8 @@ cargo test --test real_data -- --ignored --nocapture     # diễn tập trên B�
 ```
 
 `probe` và `real_data` chỉ đọc dữ liệu của Claude và không in giá trị bí mật nào. Nên chạy cả hai trên một máy hoặc kiểu cài đặt mới (nhất là Windows) trước khi dùng thật.
+
+Khi Claude đòi đăng nhập sau một lần chuyển, nhật ký của chính Claude cho biết lý do: `~/Library/Logs/Claude/main.log` (macOS) hoặc `%APPDATA%\Claude\logs\main.log` (Windows). Các dòng `[signin]` và `[account]` ghi lại Claude có đọc được cookie không (`sign_in_cookie_present`), ai bấm đăng xuất (`involuntary=1: no` là người dùng tự bấm) và máy chủ có từ chối phiên không (`status 403`).
 
 Hai biến môi trường để thử nghiệm: `APP_SWITCH_CLAUDE_DATA_DIR` (thư mục dữ liệu Claude) và `APP_SWITCH_CLAUDE_STORE_DIR` (kho lưu tài khoản).
 

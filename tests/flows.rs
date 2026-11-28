@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use app_switch_claude::claude_app::{ClaudeControl, QuitError, QuitMode};
 use app_switch_claude::config_json;
 use app_switch_claude::cookies::SessionProbe;
-use app_switch_claude::store::Store;
+use app_switch_claude::store::{Account, Store};
 use app_switch_claude::switcher::{LiveSession, OpError, SaveOptions, Switcher};
 
 const COOKIES_A: &[u8] = include_bytes!("fixtures/cookies_logged_in_a.db");
@@ -21,6 +21,15 @@ const COOKIES_EXPIRED: &[u8] = include_bytes!("fixtures/cookies_expired.db");
 const UUID_A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 const UUID_B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
 const UUID_C: &str = "cccccccc-0000-4000-8000-000000000003";
+
+/// What Claude leaves in `oauth:tokenCache` once it has signed the account out: a single
+/// encrypted block.
+const EMPTY_TOKEN_CACHE: &str = "djEwq83vq83vq83vq83vq83vqw==";
+
+/// A token cache that holds tokens: in practice hundreds of characters.
+fn tokens(who: &str) -> String {
+    format!("tokens of {who} {}", "x".repeat(200))
+}
 
 #[derive(Default)]
 struct MockState {
@@ -160,6 +169,36 @@ impl Sandbox {
         let _ = fs::remove_file(self.data.join("config.json.journal"));
     }
 
+    /// Replace Claude's token cache, as Claude does when it mints or drops tokens.
+    fn set_tokens(&self, cache: &str) {
+        let mut config = config_json::read_effective(&self.data)
+            .unwrap()
+            .unwrap_or_default();
+        config.insert("oauth:tokenCache".into(), json!(cache));
+        fs::write(
+            self.data.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// What a sign-out leaves behind, whether the user clicked "Log out" in Claude or
+    /// the server refused the session: no login cookie, an emptied token cache, and the
+    /// account id still in the config.
+    fn claude_signs_out(&self) {
+        fs::write(self.data.join("Cookies"), COOKIES_LOGGED_OUT).unwrap();
+        self.set_tokens(EMPTY_TOKEN_CACHE);
+    }
+
+    fn account(&self, label: &str) -> Account {
+        let overview = self.switcher.overview().unwrap();
+        let found = overview.accounts.iter().find(|a| a.account.label == label);
+        found
+            .unwrap_or_else(|| panic!("no account named {label}"))
+            .account
+            .clone()
+    }
+
     fn set_marker(&self, text: &str) {
         let dir = self.data.join("Local Storage").join("leveldb");
         fs::create_dir_all(&dir).unwrap();
@@ -257,7 +296,12 @@ fn saves_the_account_claude_is_signed_in_to() {
     );
 
     let message = s.save("  Công   việc ").unwrap();
-    assert_eq!(message, "Đã lưu tài khoản “Công việc”.");
+    // The hint comes exactly when the user is about to add the next account.
+    assert_eq!(
+        message,
+        "Đã lưu tài khoản “Công việc”. Muốn thêm tài khoản khác, hãy bấm “+ Thêm tài khoản” — \
+         đừng Log out trong Claude."
+    );
     assert_eq!(s.labels(), ["Công việc"]);
     assert_eq!(s.live(), saved(&s, "Công việc"));
 
@@ -401,10 +445,13 @@ fn an_unsaved_session_is_kept_when_switching_away() {
     s.log_in("A", Some(UUID_A), COOKIES_A);
     s.save("A").unwrap();
     // The user signs in to another account inside Claude, without telling this tool.
+    // That takes a log-out, which ended A's session on the server.
     s.log_in("C", Some(UUID_C), COOKIES_B);
+    assert!(s.account("A").signed_out);
 
     let message = s.switch("A").unwrap();
     assert!(message.contains("“Tài khoản chưa đặt tên”"), "{message}");
+    assert!(message.contains("phiên cũ của “A”"), "{message}");
     assert_eq!(s.labels(), ["A", "Tài khoản chưa đặt tên"]);
     assert_eq!(s.marker().as_deref(), Some("A"));
 
@@ -671,9 +718,10 @@ fn a_fresh_login_still_in_claudes_memory_shows_up_but_is_not_captured_blindly() 
     s.save("A").unwrap();
     s.switcher.prepare_new_login(false, &quiet).unwrap();
 
-    // Claude is running and has recorded the new account, but the login cookie has not
-    // reached the disk yet.
+    // Claude is running and has recorded the new account and its tokens, but the login
+    // cookie has not reached the disk yet.
     s.log_in("B", Some(UUID_B), COOKIES_LOGGED_OUT);
+    s.set_tokens(&tokens("B"));
     assert!(s.claude.running());
     assert_eq!(
         s.live(),
@@ -685,6 +733,155 @@ fn a_fresh_login_still_in_claudes_memory_shows_up_but_is_not_captured_blindly() 
     // Operations decide with Claude stopped: this state has no login to save.
     assert!(matches!(s.save("B"), Err(OpError::NotLoggedIn)));
     assert_eq!(s.labels(), ["A"]);
+}
+
+/// The user's own first test of this tool: they saved an account, then used "Log out"
+/// inside Claude to sign in to the next one.
+#[test]
+fn logging_out_inside_claude_costs_the_saved_session_and_says_so() {
+    let s = sandbox();
+    s.log_in("A", Some(UUID_A), COOKIES_A);
+    s.set_tokens(&tokens("A"));
+    s.claude.set(|c| c.running = true);
+    s.save("A").unwrap();
+
+    // "Log out" in Claude. It sits at its login screen, its config still naming A:
+    // that is not a login (it used to be shown as "A in use").
+    s.claude_signs_out();
+    assert!(s.claude.running());
+    assert_eq!(s.live(), LiveSession::LoggedOut);
+    let a = s.account("A");
+    assert!(a.signed_out, "A's saved session died with the log-out");
+    assert!(!s.switcher.overview().unwrap().accounts[0].is_live);
+
+    // The user signs in to B and saves it.
+    s.log_in("B", Some(UUID_B), COOKIES_B);
+    s.set_tokens(&tokens("B"));
+    assert_eq!(
+        s.live(),
+        LiveSession::Unsaved {
+            account_uuid: Some(UUID_B.into())
+        }
+    );
+    s.save("B").unwrap();
+    assert!(s.account("A").signed_out);
+    assert!(!s.account("B").signed_out);
+
+    // Going back to A puts its old session into Claude and says what to expect…
+    let message = s.switch("A").unwrap();
+    assert_eq!(
+        message,
+        "Đã mở Claude với phiên cũ của “A”. Nếu Claude hiện màn hình đăng nhập, hãy đăng nhập \
+         lại tài khoản này."
+    );
+    assert_eq!(fs::read(s.data.join("Cookies")).unwrap(), COOKIES_A);
+    // …the server refuses it, and Claude shows its login screen.
+    s.claude_signs_out();
+    assert_eq!(s.live(), LiveSession::LoggedOut);
+    assert!(s.account("A").signed_out);
+    assert!(!s.account("B").signed_out);
+
+    // The user logs in to A right there. It is recognised without being saved again.
+    s.log_in("A", Some(UUID_A), COOKIES_A);
+    s.set_marker("A, logged in again");
+    assert_eq!(s.live(), saved(&s, "A"));
+    assert!(!s.account("A").signed_out);
+    assert_eq!(s.labels(), ["A", "B"]);
+
+    // From here on everything works: the new session of A is captured when leaving it…
+    assert_eq!(s.switch("B").unwrap(), "Đã chuyển sang “B”.");
+    assert_eq!(fs::read(s.data.join("Cookies")).unwrap(), COOKIES_B);
+    assert_eq!(s.marker().as_deref(), Some("B"));
+    // …and comes back.
+    assert_eq!(s.switch("A").unwrap(), "Đã chuyển sang “A”.");
+    assert_eq!(s.marker().as_deref(), Some("A, logged in again"));
+    assert!(!s.account("A").signed_out);
+    assert!(!s.account("B").signed_out);
+}
+
+#[test]
+fn a_session_the_server_refuses_shows_before_the_cookie_is_gone() {
+    let s = sandbox();
+    s.log_in("A", Some(UUID_A), COOKIES_A);
+    s.set_tokens(&tokens("A"));
+    s.save("A").unwrap();
+    s.log_in("B", Some(UUID_B), COOKIES_B);
+    s.set_tokens(&tokens("B"));
+    s.save("B").unwrap();
+
+    s.switch("A").unwrap();
+    assert_eq!(s.live(), saved(&s, "A"));
+
+    // The server answers 403. Claude drops its tokens at once, while its cookie file keeps
+    // the login for up to half a minute more.
+    s.set_tokens(EMPTY_TOKEN_CACHE);
+    assert_eq!(fs::read(s.data.join("Cookies")).unwrap(), COOKIES_A);
+    assert_eq!(s.live(), LiveSession::LoggedOut);
+    assert!(s.account("A").signed_out);
+
+    // Then the cookie goes too. Nothing changes, and B was never affected.
+    s.claude_signs_out();
+    assert_eq!(s.live(), LiveSession::LoggedOut);
+    assert!(s.account("A").signed_out);
+    assert!(!s.account("B").signed_out);
+    assert_eq!(s.switch("B").unwrap(), "Đã chuyển sang “B”.");
+    assert_eq!(s.live(), saved(&s, "B"));
+}
+
+#[test]
+fn a_new_login_without_tokens_yet_is_not_taken_for_a_sign_out() {
+    let s = sandbox();
+    s.log_in("A", Some(UUID_A), COOKIES_A);
+    s.set_tokens(&tokens("A"));
+    s.claude.set(|c| c.running = true);
+    s.save("A").unwrap();
+    assert_eq!(s.live(), saved(&s, "A"));
+
+    // The user logs out and straight back in to the same account. The new login has a
+    // different cookie, and Claude has not minted tokens for it yet.
+    fs::write(s.data.join("Cookies"), COOKIES_B).unwrap();
+    s.set_tokens(EMPTY_TOKEN_CACHE);
+    assert_eq!(s.live(), saved(&s, "A"));
+    assert!(!s.account("A").signed_out);
+}
+
+#[test]
+fn a_wiped_data_directory_does_not_condemn_the_saved_session() {
+    let s = sandbox();
+    s.log_in("A", Some(UUID_A), COOKIES_A);
+    s.save("A").unwrap();
+
+    // Claude was reinstalled or its data removed: nobody logged out on the server.
+    for entry in ["Cookies", "Cookies-journal", "config.json"] {
+        fs::remove_file(s.data.join(entry)).unwrap();
+    }
+    assert_eq!(s.live(), LiveSession::LoggedOut);
+    assert!(!s.account("A").signed_out);
+
+    // The saved session is restored as usual.
+    assert_eq!(s.switch("A").unwrap(), "Đã chuyển sang “A”.");
+    assert_eq!(s.live(), saved(&s, "A"));
+}
+
+#[test]
+fn a_cookie_store_caught_in_the_middle_of_a_write_proves_nothing() {
+    let s = sandbox();
+    s.log_in("A", Some(UUID_A), COOKIES_A);
+    s.claude.set(|c| c.running = true);
+    s.save("A").unwrap();
+
+    // Chromium is rewriting the database: its journal has content, and the file may hold
+    // anything at this instant, here a state without the login cookie.
+    fs::write(s.data.join("Cookies"), COOKIES_LOGGED_OUT).unwrap();
+    fs::write(s.data.join("Cookies-journal"), b"rollback data").unwrap();
+    assert_eq!(s.live(), saved(&s, "A"));
+    assert!(!s.account("A").signed_out);
+
+    // The write is over and the cookie is back: all is as before.
+    fs::write(s.data.join("Cookies"), COOKIES_A).unwrap();
+    fs::write(s.data.join("Cookies-journal"), b"").unwrap();
+    assert_eq!(s.live(), saved(&s, "A"));
+    assert!(!s.account("A").signed_out);
 }
 
 #[test]

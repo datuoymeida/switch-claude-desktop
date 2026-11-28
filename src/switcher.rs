@@ -5,10 +5,16 @@
 //! tool's store. Switching replaces the live session with a snapshot while Claude is not
 //! running, after first refreshing the snapshot of the session being replaced (tokens and
 //! cookies rotate, so the newest copy is the only one sure to work).
+//!
+//! A snapshot is only as good as the session behind it. Logging out inside Claude ends the
+//! session on the server, and logging out is the only way to change accounts there. So when
+//! Claude signs an account out, or shows up signed in to a different one, the snapshot of
+//! the account that was live is marked `signed_out`: it needs a fresh login.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::claude_app::{ClaudeControl, DesktopClaude, QuitError, QuitMode};
@@ -28,6 +34,8 @@ const INTERRUPTED_MESSAGE: &str = "Lần đổi tài khoản trước chưa hoà
 const REOPENED_MESSAGE: &str =
     "Claude đã được mở lại trong lúc đang đổi tài khoản. Hãy bấm Chuyển lần nữa.";
 const NOT_IN_LIST_MESSAGE: &str = "Tài khoản này không còn trong danh sách.";
+const ADD_ANOTHER_HINT: &str = "Muốn thêm tài khoản khác, hãy bấm “+ Thêm tài khoản” — đừng \
+     Log out trong Claude.";
 
 /// Receives short status lines while an operation runs.
 pub type Progress<'a> = &'a dyn Fn(&str);
@@ -107,36 +115,51 @@ pub struct Overview {
 /// What Claude's data directory says about the signed-in account.
 struct Live {
     probe: SessionProbe,
-    /// The account id Claude recorded in its config, if any.
+    /// The account id Claude recorded in its config, if any. Claude keeps it after a
+    /// sign-out ("last known"), so on its own it does not mean anybody is logged in.
     uuid: Option<String>,
+    /// Claude holds OAuth tokens for the account; see [`config_json::has_tokens`].
+    has_tokens: bool,
 }
 
 fn read_live(data_dir: &Path) -> Live {
-    let uuid = config_json::read_effective(data_dir)
-        .ok()
-        .flatten()
-        .as_ref()
-        .and_then(config_json::account_uuid);
+    let config = config_json::read_effective(data_dir).ok().flatten();
     Live {
         probe: cookies::probe_session(data_dir),
-        uuid,
+        uuid: config.as_ref().and_then(config_json::account_uuid),
+        has_tokens: config.as_ref().is_some_and(config_json::has_tokens),
     }
 }
 
+/// What Claude has done that its cookie file does not show yet. Chromium writes cookie
+/// changes to disk up to half a minute late, while Claude's config is written at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// Nothing is known beyond the cookie file.
+    Nothing,
+    /// A login whose cookie is still on its way to the disk.
+    SignIn,
+    /// A sign-out whose cookie is still on the disk.
+    SignOut,
+}
+
+/// The login Claude was last seen holding tokens for.
+#[derive(Debug, PartialEq, Eq)]
+struct TokensSeen {
+    uuid: String,
+    cookie_expiry: Option<i64>,
+}
+
 /// Decide which account the live session belongs to.
-///
-/// `claude_is_running` relaxes the login check: a running Claude holds a fresh login in
-/// memory for up to half a minute before the cookie reaches the disk, while its config
-/// already names the account. Operations always decide with Claude stopped.
-fn resolve(registry: &Registry, live: &Live, now: i64, claude_is_running: bool) -> LiveSession {
+fn resolve(registry: &Registry, live: &Live, now: i64, pending: Pending) -> LiveSession {
     if registry.rewrite_in_progress {
         return LiveSession::Interrupted;
     }
     let logged_in = match live.probe {
-        SessionProbe::LoggedIn { .. } => live.probe.is_active(now),
-        SessionProbe::LoggedOut => claude_is_running && live.uuid.is_some(),
+        SessionProbe::LoggedIn { .. } => live.probe.is_active(now) && pending != Pending::SignOut,
+        SessionProbe::LoggedOut => pending == Pending::SignIn && live.uuid.is_some(),
         // The cookie store could not be read: trust what Claude itself recorded.
-        SessionProbe::Unknown => live.uuid.is_some(),
+        SessionProbe::Unknown => live.uuid.is_some() && pending != Pending::SignOut,
     };
     if !logged_in {
         return LiveSession::LoggedOut;
@@ -162,12 +185,78 @@ fn resolve(registry: &Registry, live: &Live, now: i64, claude_is_running: bool) 
     }
 }
 
+/// Bring this tool's records in line with what happened inside Claude. Returns whether
+/// anything changed.
+///
+/// `active_id` follows the account seen in Claude, and the account it pointed at before is
+/// marked `signed_out` when Claude has signed it out or replaced it with another account
+/// (see the module documentation for why its snapshot is then of no use).
+fn reconcile(registry: &mut Registry, live: &Live, session: &LiveSession, now: i64) -> bool {
+    let before = (registry.active_id.clone(), signed_out_ids(registry));
+    // A login that has not reached the cookie file yet proves nothing so far.
+    let cookie_on_disk = live.probe.is_active(now);
+    match session {
+        LiveSession::Saved { id } if cookie_on_disk => {
+            mark_replaced_account(registry, live, Some(id));
+            registry.active_id = Some(id.clone());
+            if let Some(account) = registry.find_mut(id) {
+                account.signed_out = false;
+            }
+        }
+        LiveSession::Unsaved { .. } if cookie_on_disk => {
+            mark_replaced_account(registry, live, None);
+            registry.active_id = None;
+        }
+        LiveSession::LoggedOut => {
+            // Only when Claude's config still names the account: a data directory that
+            // was wiped says nothing about the session on the server.
+            let signed_out = registry
+                .active()
+                .filter(|active| active.account_uuid.is_some() && active.account_uuid == live.uuid)
+                .map(|active| active.id.clone());
+            if let Some(id) = signed_out {
+                if let Some(account) = registry.find_mut(&id) {
+                    account.signed_out = true;
+                }
+                registry.active_id = None;
+            }
+        }
+        _ => {}
+    }
+    before != (registry.active_id.clone(), signed_out_ids(registry))
+}
+
+/// The account this tool last saw in Claude has made way for `now_live`: it was logged out.
+fn mark_replaced_account(registry: &mut Registry, live: &Live, now_live: Option<&String>) {
+    let replaced = registry
+        .active()
+        .filter(|active| Some(&active.id) != now_live)
+        .filter(|active| {
+            // Without both ids there is no telling whether the account really changed.
+            matches!((&active.account_uuid, &live.uuid), (Some(was), Some(is)) if was != is)
+        })
+        .map(|active| active.id.clone());
+    if let Some(account) = replaced.and_then(|id| registry.find_mut(&id)) {
+        account.signed_out = true;
+    }
+}
+
+fn signed_out_ids(registry: &Registry) -> Vec<String> {
+    registry
+        .accounts
+        .iter()
+        .filter(|account| account.signed_out)
+        .map(|account| account.id.clone())
+        .collect()
+}
+
 pub struct Switcher {
     store: Store,
     data_dir: Option<PathBuf>,
     claude: Box<dyn ClaudeControl>,
     /// Keeps other copies of the app away from the store while this one runs.
     _lock: Option<StoreLock>,
+    tokens_seen: Mutex<Option<TokensSeen>>,
 }
 
 impl Switcher {
@@ -177,6 +266,7 @@ impl Switcher {
             data_dir,
             claude,
             _lock: None,
+            tokens_seen: Mutex::new(None),
         }
     }
 
@@ -204,16 +294,65 @@ impl Switcher {
         }
     }
 
+    /// Work out what Claude has done ahead of its cookie file, and remember the login it
+    /// holds tokens for so that a later sign-out is recognised at once.
+    fn pending(&self, live: &Live, now: i64, claude_is_running: bool) -> Pending {
+        let mut seen = self
+            .tokens_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(uuid) = &live.uuid else {
+            return Pending::Nothing;
+        };
+        match live.probe {
+            SessionProbe::LoggedIn { expires_unix } if live.probe.is_active(now) => {
+                let login = TokensSeen {
+                    uuid: uuid.clone(),
+                    cookie_expiry: expires_unix,
+                };
+                if live.has_tokens {
+                    *seen = Some(login);
+                    Pending::Nothing
+                } else if seen.as_ref() == Some(&login) {
+                    // The tokens Claude held for this very login are gone: it has signed
+                    // out, and the cookie is about to follow.
+                    Pending::SignOut
+                } else {
+                    Pending::Nothing
+                }
+            }
+            SessionProbe::LoggedOut => {
+                // Whatever login comes next is a new one, even with the same expiry.
+                *seen = None;
+                if claude_is_running && live.has_tokens {
+                    // Tokens for an account whose cookie is not on disk: a login has just
+                    // completed.
+                    Pending::SignIn
+                } else {
+                    Pending::Nothing
+                }
+            }
+            _ => Pending::Nothing,
+        }
+    }
+
     /// The current state of Claude and of the saved accounts.
     pub fn overview(&self) -> Result<Overview> {
-        let registry = self.store.load()?;
+        let mut registry = self.store.load()?;
         let now = now_unix();
         let claude_running = self.claude.is_running();
 
         let (live, live_probe) = match self.data_dir.as_deref().filter(|dir| dir.is_dir()) {
             Some(dir) => {
                 let live = read_live(dir);
-                (resolve(&registry, &live, now, claude_running), live.probe)
+                let pending = self.pending(&live, now, claude_running);
+                let session = resolve(&registry, &live, now, pending);
+                if reconcile(&mut registry, &live, &session, now) {
+                    // Best effort: what could not be written is worked out again at the
+                    // next look, and this overview already shows it.
+                    let _ = self.store.save(&registry);
+                }
+                (session, live.probe)
             }
             None => (LiveSession::NoDataDir, SessionProbe::LoggedOut),
         };
@@ -285,7 +424,7 @@ impl Switcher {
             .as_deref()
             .and_then(|uuid| registry.find_by_uuid(uuid))
             .map(|account| account.id.clone())
-            .or_else(|| match resolve(&registry, &live, now, false) {
+            .or_else(|| match resolve(&registry, &live, now, Pending::Nothing) {
                 LiveSession::Saved { id } => Some(id),
                 _ => None,
             });
@@ -296,6 +435,7 @@ impl Switcher {
                 let account = registry.find_mut(&id).context(NOT_IN_LIST_MESSAGE)?;
                 account.saved_at = now;
                 account.last_used_at = Some(now);
+                account.signed_out = false;
                 if live.uuid.is_some() {
                     account.account_uuid = live.uuid.clone();
                 }
@@ -317,9 +457,10 @@ impl Switcher {
                     created_at: now,
                     saved_at: now,
                     last_used_at: Some(now),
+                    signed_out: false,
                 });
                 registry.active_id = Some(id);
-                format!("Đã lưu tài khoản “{label}”.")
+                format!("Đã lưu tài khoản “{label}”. {ADD_ANOTHER_HINT}")
             }
         };
         self.store.save(&registry)?;
@@ -359,7 +500,8 @@ impl Switcher {
         let mut registry = self.store.load()?;
         let live = read_live(dir);
         let now = now_unix();
-        if resolve(&registry, &live, now, false) == (LiveSession::Saved { id: id.to_owned() }) {
+        let session = resolve(&registry, &live, now, Pending::Nothing);
+        if session == (LiveSession::Saved { id: id.to_owned() }) {
             // Claude is already on this account; its live session is the newest copy.
             registry.active_id = Some(id.to_owned());
             if let Some(account) = registry.find_mut(id) {
@@ -390,8 +532,19 @@ impl Switcher {
             account.last_used_at = Some(now);
         }
         self.store.save(&registry)?;
+        // Remember the login just handed to Claude: if the server turns it down, Claude
+        // drops its tokens, and that is how the refusal shows before the cookie goes.
+        self.pending(&read_live(dir), now, false);
 
-        let mut message = format!("Đã chuyển sang “{}”.", target.label);
+        let mut message = if target.signed_out {
+            format!(
+                "Đã mở Claude với phiên cũ của “{}”. Nếu Claude hiện màn hình đăng nhập, \
+                 hãy đăng nhập lại tài khoản này.",
+                target.label
+            )
+        } else {
+            format!("Đã chuyển sang “{}”.", target.label)
+        };
         if let Some(note) = note {
             message.push(' ');
             message.push_str(&note);
@@ -530,12 +683,13 @@ impl Switcher {
         now: i64,
         progress: Progress<'_>,
     ) -> Result<Option<String>> {
-        match resolve(registry, live, now, false) {
+        match resolve(registry, live, now, Pending::Nothing) {
             LiveSession::Saved { id } => {
                 progress("Đang lưu lại phiên hiện tại…");
                 self.capture_profile(dir, &id)?;
                 if let Some(account) = registry.find_mut(&id) {
                     account.saved_at = now;
+                    account.signed_out = false;
                     if live.uuid.is_some() {
                         account.account_uuid = live.uuid.clone();
                     }
@@ -556,6 +710,7 @@ impl Switcher {
                     created_at: now,
                     saved_at: now,
                     last_used_at: Some(now),
+                    signed_out: false,
                 });
                 Ok(Some(format!(
                     "Tài khoản đang đăng nhập trước đó chưa có trong danh sách nên đã được lưu thành “{label}”."
@@ -607,6 +762,7 @@ mod tests {
                     created_at: 0,
                     saved_at: 0,
                     last_used_at: None,
+                    signed_out: false,
                 })
                 .collect(),
         }
@@ -624,6 +780,7 @@ mod tests {
         Live {
             probe,
             uuid: uuid.map(Into::into),
+            has_tokens: false,
         }
     }
 
@@ -636,18 +793,28 @@ mod tests {
         let reg = registry(&[("a", Some("uuid-a")), ("b", Some("uuid-b"))], Some("a"));
         // The id wins even when our own "active" record points elsewhere.
         assert_eq!(
-            resolve(&reg, &live(LOGGED_IN, Some("uuid-b")), NOW, false),
+            resolve(
+                &reg,
+                &live(LOGGED_IN, Some("uuid-b")),
+                NOW,
+                Pending::Nothing
+            ),
             saved("b")
         );
         assert_eq!(
-            resolve(&reg, &live(LOGGED_IN, Some("uuid-c")), NOW, false),
+            resolve(
+                &reg,
+                &live(LOGGED_IN, Some("uuid-c")),
+                NOW,
+                Pending::Nothing
+            ),
             LiveSession::Unsaved {
                 account_uuid: Some("uuid-c".into())
             }
         );
         // No id recorded and our active account has one: do not guess.
         assert_eq!(
-            resolve(&reg, &live(LOGGED_IN, None), NOW, false),
+            resolve(&reg, &live(LOGGED_IN, None), NOW, Pending::Nothing),
             LiveSession::Unsaved { account_uuid: None }
         );
     }
@@ -656,16 +823,26 @@ mod tests {
     fn adopts_the_active_account_saved_before_claude_recorded_an_id() {
         let reg = registry(&[("a", None), ("b", Some("uuid-b"))], Some("a"));
         assert_eq!(
-            resolve(&reg, &live(LOGGED_IN, None), NOW, false),
+            resolve(&reg, &live(LOGGED_IN, None), NOW, Pending::Nothing),
             saved("a")
         );
         assert_eq!(
-            resolve(&reg, &live(LOGGED_IN, Some("uuid-new")), NOW, false),
+            resolve(
+                &reg,
+                &live(LOGGED_IN, Some("uuid-new")),
+                NOW,
+                Pending::Nothing
+            ),
             saved("a")
         );
         // Another account's id still takes precedence.
         assert_eq!(
-            resolve(&reg, &live(LOGGED_IN, Some("uuid-b")), NOW, false),
+            resolve(
+                &reg,
+                &live(LOGGED_IN, Some("uuid-b")),
+                NOW,
+                Pending::Nothing
+            ),
             saved("b")
         );
     }
@@ -674,13 +851,18 @@ mod tests {
     fn logged_out_and_expired_sessions_belong_to_nobody() {
         let reg = registry(&[("a", Some("uuid-a"))], Some("a"));
         let stale_id = live(SessionProbe::LoggedOut, Some("uuid-a"));
-        assert_eq!(resolve(&reg, &stale_id, NOW, false), LiveSession::LoggedOut);
         assert_eq!(
-            resolve(&reg, &live(EXPIRED, Some("uuid-a")), NOW, false),
+            resolve(&reg, &stale_id, NOW, Pending::Nothing),
             LiveSession::LoggedOut
         );
         assert_eq!(
-            resolve(&reg, &live(EXPIRED, Some("uuid-a")), NOW, true),
+            resolve(&reg, &live(EXPIRED, Some("uuid-a")), NOW, Pending::Nothing),
+            LiveSession::LoggedOut
+        );
+        // Not even with a login pending, or with the account id Claude keeps after a
+        // sign-out: that id is the *last known* account, not a logged-in one.
+        assert_eq!(
+            resolve(&reg, &live(EXPIRED, Some("uuid-a")), NOW, Pending::SignIn),
             LiveSession::LoggedOut
         );
     }
@@ -690,14 +872,121 @@ mod tests {
         let reg = registry(&[("a", Some("uuid-a"))], None);
         let pending = live(SessionProbe::LoggedOut, Some("uuid-new"));
         assert_eq!(
-            resolve(&reg, &pending, NOW, true),
+            resolve(&reg, &pending, NOW, Pending::SignIn),
             LiveSession::Unsaved {
                 account_uuid: Some("uuid-new".into())
             }
         );
         assert_eq!(
-            resolve(&reg, &live(SessionProbe::LoggedOut, None), NOW, true),
+            resolve(
+                &reg,
+                &live(SessionProbe::LoggedOut, None),
+                NOW,
+                Pending::SignIn
+            ),
             LiveSession::LoggedOut
+        );
+    }
+
+    #[test]
+    fn a_sign_out_counts_before_the_cookie_has_left_the_disk() {
+        let reg = registry(&[("a", Some("uuid-a"))], Some("a"));
+        let stale_cookie = live(LOGGED_IN, Some("uuid-a"));
+        assert_eq!(
+            resolve(&reg, &stale_cookie, NOW, Pending::Nothing),
+            saved("a")
+        );
+        assert_eq!(
+            resolve(&reg, &stale_cookie, NOW, Pending::SignOut),
+            LiveSession::LoggedOut
+        );
+    }
+
+    /// Run `reconcile` the way `overview` does and report (changed, active, signed out).
+    fn settle(reg: &mut Registry, live: &Live) -> (bool, Option<String>, Vec<String>) {
+        let session = resolve(reg, live, NOW, Pending::Nothing);
+        let changed = reconcile(reg, live, &session, NOW);
+        (changed, reg.active_id.clone(), signed_out_ids(reg))
+    }
+
+    #[test]
+    fn an_account_claude_signed_out_needs_a_new_login() {
+        // Claude logged the live account out; its config still names it.
+        let mut reg = registry(&[("a", Some("uuid-a")), ("b", Some("uuid-b"))], Some("a"));
+        let logged_out = live(SessionProbe::LoggedOut, Some("uuid-a"));
+        assert_eq!(
+            settle(&mut reg, &logged_out),
+            (true, None, vec!["a".into()])
+        );
+        // Looking again changes nothing more.
+        assert_eq!(
+            settle(&mut reg, &logged_out),
+            (false, None, vec!["a".into()])
+        );
+
+        // Logging in again clears the mark and makes the account the live one.
+        let back = live(LOGGED_IN, Some("uuid-a"));
+        assert_eq!(settle(&mut reg, &back), (true, Some("a".into()), vec![]));
+    }
+
+    #[test]
+    fn an_account_replaced_inside_claude_needs_a_new_login() {
+        // By an account that is not saved yet…
+        let mut reg = registry(&[("a", Some("uuid-a")), ("b", Some("uuid-b"))], Some("a"));
+        let unsaved = live(LOGGED_IN, Some("uuid-c"));
+        assert_eq!(settle(&mut reg, &unsaved), (true, None, vec!["a".into()]));
+
+        // …or by one that is.
+        let mut reg = registry(&[("a", Some("uuid-a")), ("b", Some("uuid-b"))], Some("a"));
+        let other = live(LOGGED_IN, Some("uuid-b"));
+        assert_eq!(
+            settle(&mut reg, &other),
+            (true, Some("b".into()), vec!["a".into()])
+        );
+    }
+
+    #[test]
+    fn nothing_is_concluded_without_evidence() {
+        // Claude's data was wiped: no session, but also no account named in its config.
+        let mut reg = registry(&[("a", Some("uuid-a"))], Some("a"));
+        let wiped = live(SessionProbe::LoggedOut, None);
+        assert_eq!(settle(&mut reg, &wiped), (false, Some("a".into()), vec![]));
+
+        // Claude names a different account than the one this tool put there.
+        let other = live(SessionProbe::LoggedOut, Some("uuid-z"));
+        assert_eq!(settle(&mut reg, &other), (false, Some("a".into()), vec![]));
+
+        // The account in Claude is the one expected.
+        let same = live(LOGGED_IN, Some("uuid-a"));
+        assert_eq!(settle(&mut reg, &same), (false, Some("a".into()), vec![]));
+
+        // A login that has not reached the cookie file is not acted on yet.
+        let fresh = live(SessionProbe::LoggedOut, Some("uuid-c"));
+        let session = resolve(&reg, &fresh, NOW, Pending::SignIn);
+        assert_eq!(
+            session,
+            LiveSession::Unsaved {
+                account_uuid: Some("uuid-c".into())
+            }
+        );
+        assert!(!reconcile(&mut reg, &fresh, &session, NOW));
+
+        // An interrupted rewrite is no evidence of anything.
+        reg.rewrite_in_progress = true;
+        let logged_out = live(SessionProbe::LoggedOut, Some("uuid-a"));
+        assert_eq!(
+            settle(&mut reg, &logged_out),
+            (false, Some("a".into()), vec![])
+        );
+    }
+
+    #[test]
+    fn an_account_without_a_recorded_id_is_never_marked() {
+        let mut reg = registry(&[("a", None)], Some("a"));
+        let logged_out = live(SessionProbe::LoggedOut, None);
+        assert_eq!(
+            settle(&mut reg, &logged_out),
+            (false, Some("a".into()), vec![])
         );
     }
 
@@ -709,12 +998,17 @@ mod tests {
                 &reg,
                 &live(SessionProbe::Unknown, Some("uuid-a")),
                 NOW,
-                false
+                Pending::Nothing
             ),
             saved("a")
         );
         assert_eq!(
-            resolve(&reg, &live(SessionProbe::Unknown, None), NOW, false),
+            resolve(
+                &reg,
+                &live(SessionProbe::Unknown, None),
+                NOW,
+                Pending::Nothing
+            ),
             LiveSession::LoggedOut
         );
     }
@@ -724,7 +1018,12 @@ mod tests {
         let mut reg = registry(&[("a", Some("uuid-a"))], Some("a"));
         reg.rewrite_in_progress = true;
         assert_eq!(
-            resolve(&reg, &live(LOGGED_IN, Some("uuid-a")), NOW, false),
+            resolve(
+                &reg,
+                &live(LOGGED_IN, Some("uuid-a")),
+                NOW,
+                Pending::Nothing
+            ),
             LiveSession::Interrupted
         );
     }
@@ -747,6 +1046,7 @@ mod tests {
                 created_at: 0,
                 saved_at: 0,
                 last_used_at: None,
+                signed_out: false,
             });
         }
     }
