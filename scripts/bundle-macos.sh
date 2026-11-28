@@ -11,6 +11,13 @@ cd "$(dirname "$0")/.."
 # The oldest macOS that runs Apple Silicon binaries; also written to Info.plist below.
 export MACOSX_DEPLOYMENT_TARGET=11.0
 
+# Source file paths are compiled into the program (they appear in panic messages), and on
+# this machine they start with the home folder, which carries the user's name. The app is
+# built to be handed to others, so replace those prefixes. The separator is the one
+# CARGO_ENCODED_RUSTFLAGS expects; unlike RUSTFLAGS it copes with spaces in a path.
+SEP=$(printf '\037')
+export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=~$SEP--remap-path-prefix=$PWD=."
+
 TARGETS="aarch64-apple-darwin x86_64-apple-darwin"
 # shellcheck disable=SC2086 # the list is meant to be split into words
 rustup target add $TARGETS
