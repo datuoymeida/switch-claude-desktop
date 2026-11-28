@@ -4,7 +4,7 @@
 //! - [`session`], [`config_json`] and [`cookies`] know how Claude Desktop stores a login.
 //! - [`claude_app`] quits and launches the app; [`paths`] finds its data directory.
 //! - [`store`] is this tool's own list of saved accounts.
-//! - [`ui`] is the window.
+//! - `ui` is the window; it is only built with the `gui` feature, which is on by default.
 
 pub mod claude_app;
 pub mod config_json;
@@ -14,4 +14,5 @@ pub mod paths;
 pub mod session;
 pub mod store;
 pub mod switcher;
+#[cfg(feature = "gui")]
 pub mod ui;

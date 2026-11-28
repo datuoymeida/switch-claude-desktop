@@ -11,12 +11,25 @@ path = "src/lib.rs"
 [[bin]]
 name = "app-switch-claude"
 path = "src/main.rs"
+required-features = ["gui"]
+
+[[test]]
+name = "ui"
+path = "tests/ui.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+# The window. Without it only the account-switching logic is built, which is all the
+# diagnostic program needs (examples/probe.rs): `--no-default-features` keeps the whole
+# window toolkit out of it.
+gui = ["dep:chrono", "dep:eframe"]
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 dirs = "7"
-eframe = "0.37"
+eframe = { version = "0.37", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"

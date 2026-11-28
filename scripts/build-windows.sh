@@ -35,7 +35,13 @@ docker run --rm \
     --env CARGO_BUILD_JOBS="$JOBS" \
     --workdir /src \
     "$IMAGE" \
-    cargo build --release --locked --target "$TARGET" --bin app-switch-claude --example probe
+    sh -c "
+        set -eu
+        cargo build --release --locked --target $TARGET --bin app-switch-claude
+        # The diagnostic program on its own, without the window: built together with the
+        # app it would carry the whole window toolkit along (23 MB instead of 1.4).
+        cargo build --release --locked --target $TARGET --no-default-features --example probe
+    "
 
 cp "$WORK/$TARGET/release/app-switch-claude.exe" dist/windows/AppSwitchClaude.exe
 cp "$WORK/$TARGET/release/examples/probe.exe" dist/windows/AppSwitchClaude-probe.exe
