@@ -21,6 +21,27 @@ pub const WINDOW_TITLE: &str = "Claude Account Switcher";
 /// The heading inside the window, in the language of the rest of the interface.
 const HEADING: &str = "Chuyển tài khoản Claude";
 
+/// The app icon as drawn by `scripts/make-icon.swift`.
+const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-window.png");
+
+/// The icon of the window and its taskbar entry.
+///
+/// On macOS the icon belongs to the app bundle (`scripts/bundle-macos.sh` puts it there),
+/// and the empty icon returned here tells eframe to leave it alone; without it eframe
+/// would show its own default icon in the Dock.
+pub fn window_icon() -> egui::IconData {
+    if cfg!(target_os = "macos") {
+        egui::IconData::default()
+    } else {
+        decode_icon()
+    }
+}
+
+fn decode_icon() -> egui::IconData {
+    // An unreadable picture is no reason to keep the app from starting.
+    eframe::icon_data::from_png_bytes(ICON_PNG).unwrap_or_default()
+}
+
 /// Something the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
@@ -815,6 +836,17 @@ mod tests {
             Job::Remove { id: "a".into() }.forcing_quit(),
             Job::Remove { id: "a".into() }
         );
+    }
+
+    #[test]
+    fn the_embedded_icon_is_a_usable_picture() {
+        let icon = decode_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        // The tile covers the middle; the corners outside its rounding are see-through.
+        let alpha = |x: usize, y: usize| icon.rgba[(y * 256 + x) * 4 + 3];
+        assert_eq!(alpha(128, 128), 255);
+        assert_eq!(alpha(0, 0), 0);
     }
 
     #[test]

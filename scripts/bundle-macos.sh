@@ -28,8 +28,23 @@ done
 APP="target/release/bundle/AppSwitchClaude.app"
 VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
 
+# Scratch space for the icon set and the disk image, removed again on the way out.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+# The icon: macOS wants the picture at each size it shows, packed into one .icns file.
+ICONSET="$WORK/AppIcon.iconset"
+mkdir "$ICONSET"
+for size in 16 32 128 256 512; do
+    double=$((size * 2))
+    sips -z "$size" "$size" assets/icon-macos.png --out "$ICONSET/icon_${size}x${size}.png" > /dev/null
+    sips -z "$double" "$double" assets/icon-macos.png --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null
+done
+iconutil --convert icns --output "$APP/Contents/Resources/AppIcon.icns" "$ICONSET"
+
 lipo -create -output "$APP/Contents/MacOS/AppSwitchClaude" \
     target/aarch64-apple-darwin/release/app-switch-claude \
     target/x86_64-apple-darwin/release/app-switch-claude
@@ -46,6 +61,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>local.app-switch-claude</string>
     <key>CFBundleExecutable</key>
     <string>AppSwitchClaude</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -67,8 +84,8 @@ echo "Built $APP"
 
 # The disk image: the app next to a shortcut to /Applications, to drag one onto the other.
 DMG="dist/macos/AppSwitchClaude.dmg"
-STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
+STAGE="$WORK/dmg"
+mkdir "$STAGE"
 ditto "$APP" "$STAGE/AppSwitchClaude.app"
 ln -s /Applications "$STAGE/Applications"
 mkdir -p "$(dirname "$DMG")"

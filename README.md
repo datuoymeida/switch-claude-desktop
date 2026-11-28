@@ -103,3 +103,4 @@ Trên Windows, nếu ứng dụng báo "Không mở được cửa sổ ứng d�
 | `src/paths.rs` | Tìm thư mục dữ liệu trên từng hệ điều hành |
 | `src/store.rs` | Danh sách tài khoản đã lưu |
 | `src/ui/` | Cửa sổ (egui) và luồng chạy nền |
+| `assets/`, `scripts/make-icon.swift` | Biểu tượng ứng dụng, và script vẽ lại nó khi muốn đổi màu hay chữ |
