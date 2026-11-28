@@ -2,6 +2,8 @@
 
 Chuyển nhanh giữa nhiều tài khoản Claude trong ứng dụng **Claude Desktop** (macOS và Windows) mà không phải đăng xuất rồi đăng nhập lại. Viết bằng Rust, giao diện [egui](https://github.com/emilk/egui).
 
+**Tải về:** bản dựng sẵn cho macOS (`.dmg`) và Windows (`.exe`) nằm ở trang [Releases](../../releases/latest).
+
 ## Cách dùng
 
 1. **Lưu tài khoản đang đăng nhập.** Mở ứng dụng khi Claude Desktop đã đăng nhập. Thẻ trên cùng báo "Tài khoản chưa lưu": đặt tên (ví dụ *Công việc*) rồi bấm **Lưu tài khoản này**.
